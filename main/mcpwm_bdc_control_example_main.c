@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdint.h>
 #include <stdio.h>
 #include "driver/uart.h"
 #include "sdkconfig.h"
@@ -33,8 +34,9 @@
 #define BDC_ENCODER_PCNT_HIGH_LIMIT   140
 #define BDC_ENCODER_PCNT_LOW_LIMIT    -140
 
-#define BDC_PID_LOOP_PERIOD_MS        10   // calculate the motor speed every 10ms
-#define BDC_PID_EXPECT_SPEED          20  // expected motor speed, in the pulses counted by the rotary encoder
+#define BDC_PID_SPEED_LOOP_PERIOD_MS        10   // calculate the motor speed every 10ms
+#define BDC_PID_POSITION_LOOP_PERIOD_MS     100   // calculate the motor position every 10ms
+#define BDC_PID_EXPECT_SPEED          14  // expected motor speed, in the pulses counted by the rotary encoder (pulse/0.1s)
 #define UART_PORT 					  UART_NUM_0
 #define RX_BUF_SIZE 					128
 #define QUEUE_SIZE 						256
@@ -50,17 +52,13 @@
 
 #define HEADER_BYTE1        0xAA
 #define HEADER_BYTE2        0x55
+#define OPCODE_SPEED_FBK	0x02
+#define OPCODE_POSITION_FBK 0x04
+#define OPCODE_SET_SPEED	0x03
+#define OPCODE_SET_PID_SPEED 0x01
+#define OPCODE_SET_PID_POSITION 0x05
 #define MAX_DATA_LEN        64
 #define TIMEOUT_MS          500
-
-static const char *TAG_UART = "uart_pid";
-static const char *TAG = "MTC";
-
-static QueueHandle_t uart0_queue = NULL;
-static TimerHandle_t uart_timeout_timer = NULL;
-
-// PID values
-float pid_kp = 0.6, pid_ki = 0.1, pid_kd = 0.2;
 
 typedef enum {
     WAIT_HEADER_1,
@@ -76,9 +74,34 @@ typedef enum {
 typedef struct {
     bdc_motor_handle_t motor;
     pcnt_unit_handle_t pcnt_encoder;
-    pid_ctrl_block_handle_t pid_ctrl;
+    pid_ctrl_block_handle_t pid_speed_ctrl;
+	pid_ctrl_block_handle_t pid_position_ctrl;
     int report_pulses;
+	int report_position;
 } motor_control_context_t;
+typedef struct{
+	float pid_kp;
+	float pid_ki;
+ 	float pid_kd;
+} pid_vlues_t;
+/* ------------------------------------------------------------- Local variables ----------------------------------------------------------------*/
+static const char *TAG_UART = "uart_pid";
+static const char *TAG = "MTC";
+
+static QueueHandle_t uart0_queue = NULL;
+static TimerHandle_t uart_timeout_timer = NULL;
+
+// PID values
+float pid_kp = 0.6, pid_ki = 0.1, pid_kd = 0.2;
+pid_vlues_t pid_values_speed;
+pid_vlues_t pid_values_position;
+
+// Speed set point value
+static float pid_speed_setpoint = BDC_PID_EXPECT_SPEED;
+// Position set point value
+static float pid_position_setpoit = 140;
+
+static motor_control_context_t motor_ctrl_ctx;
 
 static uart_parse_state_t state = WAIT_HEADER_1;
 
@@ -91,7 +114,7 @@ static uint16_t checksum_calc = 0;
 static uint8_t checksum_lo = 0;
 static uint8_t checksum_hi = 0;
 
-
+/*-----------------------------------------------------------------------------------------------*/
 // Checksum: simple 16-bit additive
 uint16_t calc_checksum(const uint8_t *data, size_t len) {
     uint16_t sum = 0;
@@ -102,11 +125,25 @@ uint16_t calc_checksum(const uint8_t *data, size_t len) {
 }
 
 // PID update logic
-void update_pid(const uint8_t *data) {
-    memcpy(&pid_kp, data, 4);
-    memcpy(&pid_ki, data + 4, 4);
-    memcpy(&pid_kd, data + 8, 4);
-    ESP_LOGI(TAG_UART, "PID Updated: Kp=%.3f, Ki=%.3f, Kd=%.3f", pid_kp, pid_ki, pid_kd);
+void update_speed_pid(const uint8_t *data) {
+    memcpy(&pid_values_speed.pid_kp, data, 4);
+    memcpy(&pid_values_speed.pid_ki, data + 4, 4);
+    memcpy(&pid_values_speed.pid_kd, data + 8, 4);
+    ESP_LOGI(TAG_UART, "PID speed Updated: Kp=%.3f, Ki=%.3f, Kd=%.3f", pid_values_speed.pid_kp, pid_values_speed.pid_ki, pid_values_speed.pid_kd);
+}
+void update_position_pid(const uint8_t *data) {
+    memcpy(&pid_values_position.pid_kp, data, 4);
+    memcpy(&pid_values_position.pid_ki, data + 4, 4);
+    memcpy(&pid_values_position.pid_kd, data + 8, 4);
+    ESP_LOGI(TAG_UART, "PID speed Updated: Kp=%.3f, Ki=%.3f, Kd=%.3f", pid_values_position.pid_kp, pid_values_position.pid_ki, pid_values_position.pid_kd);
+}
+void pid_set_speed_setpoint(float spd) {
+    pid_speed_setpoint = spd;
+    ESP_LOGI("PID", "Updated speed setpoint: %f", pid_speed_setpoint);
+}
+void pid_set_position_setpoint(float pst) {
+    pid_position_setpoit = pst;
+    ESP_LOGI("PID", "Updated position setpoint: %f", pid_position_setpoit);
 }
 
 // Timer callback: called when timeout (no data for TIMEOUT_MS)
@@ -122,15 +159,15 @@ void uart_reset_timeout() {
     xTimerStart(uart_timeout_timer, 0);
 }
 
-// Build feedback packet (opcode 0x02)
-static void send_speed_feedback(float speed) {
+// Build feedback packet (opcode 0x02 or 0x04)
+static void send_feedback(float value, uint8_t opcode) {
     uint8_t msg[64];
     int idx = 0;
     msg[idx++] = 0xAA;
     msg[idx++] = 0x55;
-    msg[idx++] = 0x02;   // opcode
+    msg[idx++] = opcode;   // opcode
     msg[idx++] = 4;      // length
-    memcpy(&msg[idx], &speed, 4);
+    memcpy(&msg[idx], &value, 4);
     idx += 4;
 
     uint16_t checksum = 0;
@@ -194,12 +231,20 @@ void uart_parse_byte(uint8_t byte) {
 
         case WAIT_CHECKSUM_2:
             checksum_hi = byte;
+			checksum_calc &= 0xFFFF;
             {
                 uint16_t received_checksum = ((uint16_t)checksum_hi << 8) | checksum_lo;
                 if (received_checksum == checksum_calc) {
-                    if (opcode == 0x01 && length == 12) {
-                        update_pid(data_buf);
-                    } else {
+                    if (opcode == OPCODE_SET_PID_SPEED && length == 12) {
+                        update_speed_pid(data_buf);
+                    } else if (opcode == OPCODE_SET_SPEED && length == 4) {  // Speed setpoint
+			            float spd = 0;
+			            memcpy(&spd, data_buf, 4);
+			            pid_set_speed_setpoint(spd);   // <-- apply new target speed
+			        } else if (opcode == OPCODE_SET_PID_POSITION && length == 12){
+						update_position_pid(data_buf);
+					}
+					else {
                         ESP_LOGW(TAG_UART, "Unknown opcode or invalid length");
                     }
                 } else {
@@ -257,25 +302,48 @@ static void uart_event_task(void *pvParameters) {
 static void pid_loop_cb(void *args)
 {
     static int last_pulse_count = 0;
+	/* This variable to store loop count for speed. Every 10 counts for speed, position start once */
+	static uint8_t loop_count = 0;
     motor_control_context_t *ctx = (motor_control_context_t *)args;
     pcnt_unit_handle_t pcnt_unit = ctx->pcnt_encoder;
-    pid_ctrl_block_handle_t pid_ctrl = ctx->pid_ctrl;
+    pid_ctrl_block_handle_t pid_speed_ctrl = ctx->pid_speed_ctrl;
+	pid_ctrl_block_handle_t pid_position_ctrl = ctx->pid_position_ctrl;
     bdc_motor_handle_t motor = ctx->motor;
 
     // get the result from rotary encoder
     int cur_pulse_count = 0;
     pcnt_unit_get_count(pcnt_unit, &cur_pulse_count);
+	ctx->report_position = cur_pulse_count;
     int real_pulses = cur_pulse_count - last_pulse_count;
     last_pulse_count = cur_pulse_count;
     ctx->report_pulses = real_pulses;
 
+	// set new position
+	float error_position = 0;
+	error_position = pid_position_setpoit - cur_pulse_count;
+	if(0 == loop_count)
+	{
+		//pid_compute(pid_position_ctrl, error_position, &pid_speed_setpoint);
+	}
     // calculate the speed error
-    float error = BDC_PID_EXPECT_SPEED - real_pulses;
+    float error_speed = pid_speed_setpoint - real_pulses;
     float new_speed = 0;
-
+	
     // set the new speed
-    pid_compute(pid_ctrl, error, &new_speed);
-    bdc_motor_set_speed(motor, (uint32_t)new_speed);
+    pid_compute(pid_speed_ctrl, error_speed, &new_speed);
+	if (new_speed >= 0) {
+	    bdc_motor_forward(motor);
+	    bdc_motor_set_speed(motor, (uint32_t)new_speed);
+	} else {
+	    bdc_motor_reverse(motor);
+	    bdc_motor_set_speed(motor, (uint32_t)(-new_speed)); // use absolute value
+	}
+	// increase loop count once the callback finishes, and reset if it is equal to 10
+    loop_count ++;
+	if(loop_count >= 10)
+	{
+		loop_count = 0;
+	}
 }
 
 void app_main(void)
@@ -311,9 +379,9 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     
-    static motor_control_context_t motor_ctrl_ctx = {
+    /*static motor_control_context_t motor_ctrl_ctx = {
         .pcnt_encoder = NULL,
-    };
+    };*/
 
     ESP_LOGI(TAG, "Create DC motor");
     bdc_motor_config_t motor_config = {
@@ -326,7 +394,7 @@ void app_main(void)
         .resolution_hz = BDC_MCPWM_TIMER_RESOLUTION_HZ,
     };
     bdc_motor_handle_t motor = NULL;
-    ESP_ERROR_CHECK(bdc_motor_new_mcpwm_device(&motor_config, &mcpwm_config, &motor));
+    ESP_ERROR_CHECK( bdc_motor_new_mcpwm_device(&motor_config, &mcpwm_config, &motor));
     motor_ctrl_ctx.motor = motor;
 
     ESP_LOGI(TAG, "Init pcnt driver to decode rotary signal");
@@ -365,22 +433,38 @@ void app_main(void)
     motor_ctrl_ctx.pcnt_encoder = pcnt_unit;
 
     ESP_LOGI(TAG, "Create PID control block");
-    pid_ctrl_parameter_t pid_runtime_param = {
+    pid_ctrl_parameter_t pid_spd_runtime_param = {
         .kp = pid_kp,
         .ki = pid_ki,
         .kd = pid_kd,
         .cal_type = PID_CAL_TYPE_INCREMENTAL,
         .max_output   = BDC_MCPWM_DUTY_TICK_MAX - 1,
-        .min_output   = 0,
+        .min_output   = -(BDC_MCPWM_DUTY_TICK_MAX - 1),
         .max_integral = 1000,
         .min_integral = -1000,
     };
-    pid_ctrl_block_handle_t pid_ctrl = NULL;
-    pid_ctrl_config_t pid_config = {
-        .init_param = pid_runtime_param,
+	pid_ctrl_parameter_t pid_pst_runtime_param = {
+        .kp = pid_kp,
+        .ki = pid_ki,
+        .kd = pid_kd,
+        .cal_type = PID_CAL_TYPE_INCREMENTAL,
+        .max_output   = 20,
+        .min_output   = -20	,
+        .max_integral = 1000,
+        .min_integral = -1000,
     };
-    ESP_ERROR_CHECK(pid_new_control_block(&pid_config, &pid_ctrl));
-    motor_ctrl_ctx.pid_ctrl = pid_ctrl;
+    pid_ctrl_block_handle_t pid_spd_ctrl = NULL;
+	pid_ctrl_block_handle_t pid_pst_ctrl = NULL;
+    pid_ctrl_config_t pid_spd_config = {
+        .init_param = pid_spd_runtime_param,
+    };
+    pid_ctrl_config_t pid_pst_config = {
+        .init_param = pid_pst_runtime_param,
+    };
+    ESP_ERROR_CHECK(pid_new_control_block(&pid_spd_config, &pid_spd_ctrl));
+    motor_ctrl_ctx.pid_speed_ctrl = pid_spd_ctrl;
+    ESP_ERROR_CHECK(pid_new_control_block(&pid_pst_config, &pid_pst_ctrl));
+    motor_ctrl_ctx.pid_position_ctrl = pid_pst_ctrl;
 
     ESP_LOGI(TAG, "Create a timer to do PID calculation periodically");
     const esp_timer_create_args_t periodic_timer_args = {
@@ -397,7 +481,7 @@ void app_main(void)
     ESP_ERROR_CHECK(bdc_motor_forward(motor));
 
     ESP_LOGI(TAG, "Start motor speed loop");
-    ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer, BDC_PID_LOOP_PERIOD_MS * 1000));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(pid_loop_timer, BDC_PID_SPEED_LOOP_PERIOD_MS * 1000));
 
 	// Start UART event task
     xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
@@ -406,14 +490,17 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(100));
         // the following logging format is according to the requirement of serial-studio frame format
         // also see the dashboard config file `serial-studio-dashboard.json` for more information
-		/* Continiously update the PID values */
+		pid_pst_runtime_param.kp = pid_values_position.pid_kp;
+		pid_pst_runtime_param.ki = pid_values_position.pid_ki;
+		pid_pst_runtime_param.kd = pid_values_position.pid_kd;
 
-		pid_runtime_param.kp = pid_kp;
-		pid_runtime_param.ki = pid_ki;
-		pid_runtime_param.kd = pid_kd;
+		pid_spd_runtime_param.kp = pid_values_speed.pid_kp;
+		pid_spd_runtime_param.ki = pid_values_speed.pid_ki;
+		pid_spd_runtime_param.kd = pid_values_speed.pid_kd;
 
-		pid_update_parameters(motor_ctrl_ctx.pid_ctrl, &pid_runtime_param);
-       	// /* printf("/*%d*/\r\n", motor_ctrl_ctx.report_pulses); */
-		send_speed_feedback(motor_ctrl_ctx.report_pulses);
+		pid_update_parameters(motor_ctrl_ctx.pid_speed_ctrl, &pid_spd_runtime_param);
+		pid_update_parameters(motor_ctrl_ctx.pid_position_ctrl, &pid_pst_runtime_param);
+		/* send feedback to monitor */
+		send_feedback(motor_ctrl_ctx.report_pulses, OPCODE_SPEED_FBK);
     }
 }
